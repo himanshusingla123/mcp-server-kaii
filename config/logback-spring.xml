@@ -1,0 +1,39 @@
+<!-- 
+    logback-spring.xml
+    Place this in src/main/resources/ of EACH Spring Boot service.
+    It writes log entries as (:Log) nodes in Neo4j alongside
+    the normal console/file output.
+
+    Change SERVICE_NAME_HERE to the actual service name,
+    or inject via: ${spring.application.name}
+-->
+<configuration>
+
+    <!-- Normal console appender (keep as-is) -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 
+        Custom Neo4j appender.
+        See Neo4jLogAppender.java — include it in your service's codebase.
+    -->
+    <appender name="NEO4J" class="com.yourorg.logging.Neo4jLogAppender">
+        <neo4jUri>${NEO4J_URI:-bolt://localhost:7687}</neo4jUri>
+        <neo4jUser>${NEO4J_USER:-neo4j}</neo4jUser>
+        <neo4jPassword>${NEO4J_PASSWORD:-password}</neo4jPassword>
+        <serviceName>${spring.application.name:-unknown-service}</serviceName>
+        <!-- Only send WARN and above to Neo4j to avoid flooding -->
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="NEO4J" />
+    </root>
+
+</configuration>

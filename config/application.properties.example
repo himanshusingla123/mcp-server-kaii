@@ -1,0 +1,19 @@
+# ─────────────────────────────────────────────────────────────────
+# Neo4j Log Appender — add this to each Spring Boot service's
+# application.properties (or application.yml equivalent)
+#
+# This uses a custom Logback appender to write logs as Neo4j nodes.
+# The service name is injected via the SERVICE_NAME env var or
+# spring.application.name property.
+# ─────────────────────────────────────────────────────────────────
+
+spring.application.name=user-service
+
+# Neo4j connection (shared across all services)
+spring.neo4j.uri=bolt://localhost:7687
+spring.neo4j.authentication.username=neo4j
+spring.neo4j.authentication.password=password
+
+# Actuator — expose health endpoint (required for MCP health checks)
+management.endpoints.web.exposure.include=health,info,metrics
+management.endpoint.health.show-details=always
