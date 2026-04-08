@@ -1,594 +1,405 @@
 """
-MCP Server — Microservice Health Monitor + Kaii Agent Bridge
-Monitors 4 Spring Boot services, fetches logs from Neo4j,
-triggers Kaii Agent on unhealthy services, and can restart services locally.
+FastMCP Server — Microservices Orchestration + Ticket Management
+Exposes tools for: User, Order, Payment, Notification, and Ticket services.
+Run: python server.py
 """
 
 import asyncio
-import subprocess
-import os
+import httpx
+import sqlite3
 import json
-import logging
 from datetime import datetime
-from typing import Any
-
-import requests
-from neo4j import GraphDatabase
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp import types
+from typing import Optional
+from fastmcp import FastMCP
 
 # ─────────────────────────────────────────────
-# CONFIGURATION
+# Service Registry
 # ─────────────────────────────────────────────
-
-# Base URLs per service
 SERVICES = {
     "user":         "http://localhost:8080",
     "order":        "http://localhost:8082",
     "payment":      "http://localhost:8083",
     "notification": "http://localhost:8084",
+    "ticket":       "http://localhost:8090",
 }
 
-# Each service exposes its own health path returning a plain string: "HEALTHY" | "UNHEALTHY"
-HEALTH_PATHS = {
-    "user":         "/user/health",
-    "order":        "/order/health",
-    "payment":      "/payment/health",
-    "notification": "/notification/health",
+# Dependency graph: each service calls the next downstream
+DEPENDENCY_GRAPH = {
+    "user":         ["order"],
+    "order":        ["payment"],
+    "payment":      ["notification"],
+    "notification": [],
+    "ticket":       ["user", "order", "payment", "notification"],  # ticket tracks all four
 }
 
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-
-# Your organisation's Kaii Agent REST endpoint
-KAII_AGENT_URL = os.getenv("KAII_AGENT_URL", "http://localhost:9000/kaii/analyze")
-
-# Local restart scripts — one per service
-RESTART_SCRIPTS = {
-    "user":         "./scripts/restart_user.sh",
-    "order":        "./scripts/restart_order.sh",
-    "payment":      "./scripts/restart_payment.sh",
-    "notification": "./scripts/restart_notification.sh",
-}
-
-HEALTH_TIMEOUT = 5   # seconds
-LOG_FETCH_LIMIT = 50 # max log entries per service
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("mcp-health-monitor")
+# ─────────────────────────────────────────────
+# FastMCP App
+# ─────────────────────────────────────────────
+mcp = FastMCP(
+    name="Microservices Orchestration Server",
+    instructions=(
+        "This MCP server exposes tools to interact with five microservices: "
+        "user (8080), order (8082), payment (8083), notification (8084), and ticket (8090). "
+        "Use health/toggle tools to monitor/control cascading health. "
+        "Use process tools to trigger chain calls. "
+        "Use ticket tools to manage issues in batch. "
+        "Use dependency_graph to understand service relationships."
+    ),
+)
 
 # ─────────────────────────────────────────────
-# NEO4J CLIENT
+# Helpers
 # ─────────────────────────────────────────────
+async def _get(url: str) -> str:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.text
 
-class Neo4jLogClient:
-    """
-    Queries your existing @Node("Log") Spring Data Neo4j model:
+async def _post(url: str, json_body: Optional[dict] = None) -> str:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, json=json_body or {})
+        r.raise_for_status()
+        return r.text if r.text else "OK"
 
-        (:Log {
-            id:          Long,
-            message:     String,
-            status:      "HEALTHY" | "UNHEALTHY" | "DEGRADED",
-            error:       String,
-            timestamp:   datetime,
-            serviceName: String
-        })
-    """
-
-    # Status values that indicate a problem — sent to Kaii Agent
-    UNHEALTHY_STATUSES = {"UNHEALTHY", "DEGRADED"}
-
-    def __init__(self):
-        self._driver = None
-
-    def _get_driver(self):
-        if self._driver is None:
-            self._driver = GraphDatabase.driver(
-                NEO4J_URI,
-                auth=(NEO4J_USER, NEO4J_PASSWORD)
-            )
-        return self._driver
-
-    def _record_to_dict(self, record) -> dict:
-        """Convert a Neo4j record to a clean Python dict."""
-        return {
-            "id":          record["id"],
-            "serviceName": record["serviceName"],
-            "status":      record["status"],
-            "message":     record["message"],
-            "error":       record["error"],
-            "timestamp":   str(record["timestamp"]),
-        }
-
-    def fetch_logs(self, service_name: str, limit: int = LOG_FETCH_LIMIT,
-                   status_filter: str = None) -> list[dict]:
-        """
-        Fetch recent logs for a service from Neo4j.
-        Optionally filter by status: HEALTHY | UNHEALTHY | DEGRADED
-        """
+async def _put(url: str, json_body: Optional[dict] = None) -> str:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.put(url, json=json_body or {})
+        r.raise_for_status()
         try:
-            driver = self._get_driver()
-            with driver.session() as session:
-                if status_filter:
-                    query = """
-                        MATCH (l:Log {serviceName: $serviceName, status: $status})
-                        RETURN l.id          AS id,
-                               l.serviceName AS serviceName,
-                               l.status      AS status,
-                               l.message     AS message,
-                               l.error       AS error,
-                               l.timestamp   AS timestamp
-                        ORDER BY l.timestamp DESC
-                        LIMIT $limit
-                    """
-                    result = session.run(
-                        query,
-                        serviceName=service_name,
-                        status=status_filter.upper(),
-                        limit=limit
-                    )
-                else:
-                    query = """
-                        MATCH (l:Log {serviceName: $serviceName})
-                        RETURN l.id          AS id,
-                               l.serviceName AS serviceName,
-                               l.status      AS status,
-                               l.message     AS message,
-                               l.error       AS error,
-                               l.timestamp   AS timestamp
-                        ORDER BY l.timestamp DESC
-                        LIMIT $limit
-                    """
-                    result = session.run(
-                        query,
-                        serviceName=service_name,
-                        limit=limit
-                    )
+            return json.dumps(r.json())
+        except Exception:
+            return r.text
 
-                return [self._record_to_dict(r) for r in result]
+# ─────────────────────────────────────────────
+# ── CORE SERVICE TOOLS ────────────────────────
+# ─────────────────────────────────────────────
 
-        except Exception as e:
-            logger.error(f"Neo4j fetch_logs failed for {service_name}: {e}")
-            return [{"error": str(e), "serviceName": service_name}]
+# ── /process ──────────────────────────────────
 
-    def fetch_unhealthy_logs(self, service_name: str, limit: int = 20) -> list[dict]:
-        """
-        Fetch only UNHEALTHY and DEGRADED log entries for a service.
-        These are the entries sent to Kaii Agent when a service is down.
-        """
+@mcp.tool(description="Trigger the User service process (GET /user/process). It chains to Order → Payment → Notification.")
+async def user_process() -> str:
+    return await _get(f"{SERVICES['user']}/user/process")
+
+
+@mcp.tool(description="Trigger the Order service process (GET /order/process). It chains to Payment → Notification.")
+async def order_process() -> str:
+    return await _get(f"{SERVICES['order']}/order/process")
+
+
+@mcp.tool(description="Trigger the Payment service process (GET /payment/process). It chains to Notification.")
+async def payment_process() -> str:
+    return await _get(f"{SERVICES['payment']}/payment/process")
+
+
+@mcp.tool(description="Trigger the Notification service process (GET /notification/process). Terminal service.")
+async def notification_process() -> str:
+    return await _get(f"{SERVICES['notification']}/notification/process")
+
+
+# ── /health ───────────────────────────────────
+
+@mcp.tool(description="Check health status of the User service (GET /user/health).")
+async def user_health() -> str:
+    return await _get(f"{SERVICES['user']}/user/health")
+
+
+@mcp.tool(description="Check health status of the Order service (GET /order/health).")
+async def order_health() -> str:
+    return await _get(f"{SERVICES['order']}/order/health")
+
+
+@mcp.tool(description="Check health status of the Payment service (GET /payment/health).")
+async def payment_health() -> str:
+    return await _get(f"{SERVICES['payment']}/payment/health")
+
+
+@mcp.tool(description="Check health status of the Notification service (GET /notification/health).")
+async def notification_health() -> str:
+    return await _get(f"{SERVICES['notification']}/notification/health")
+
+
+@mcp.tool(description="Check ALL four core services health at once and return a summary.")
+async def all_health_check() -> str:
+    results = {}
+    for name in ["user", "order", "payment", "notification"]:
         try:
-            driver = self._get_driver()
-            with driver.session() as session:
-                query = """
-                    MATCH (l:Log {serviceName: $serviceName})
-                    WHERE l.status IN ['UNHEALTHY', 'DEGRADED']
-                    RETURN l.id          AS id,
-                           l.serviceName AS serviceName,
-                           l.status      AS status,
-                           l.message     AS message,
-                           l.error       AS error,
-                           l.timestamp   AS timestamp
-                    ORDER BY l.timestamp DESC
-                    LIMIT $limit
-                """
-                result = session.run(query, serviceName=service_name, limit=limit)
-                return [self._record_to_dict(r) for r in result]
-
+            results[name] = await _get(f"{SERVICES[name]}/{name}/health")
         except Exception as e:
-            logger.error(f"Neo4j fetch_unhealthy_logs failed for {service_name}: {e}")
-            return [{"error": str(e)}]
+            results[name] = f"ERROR: {e}"
+    return json.dumps(results, indent=2)
 
-    def fetch_log_summary(self, service_name: str) -> dict:
-        """
-        Returns a count breakdown of log statuses for a service.
-        Useful for giving Kaii Agent a quick picture before deep analysis.
-        """
+
+# ── /toggle ───────────────────────────────────
+
+@mcp.tool(description="Toggle the health status of the User service (POST /user/toggle). Cascading effect propagates to Order, Payment, Notification.")
+async def user_toggle() -> str:
+    return await _post(f"{SERVICES['user']}/user/toggle")
+
+
+@mcp.tool(description="Toggle the health status of the Order service (POST /order/toggle). Cascading effect propagates to Payment, Notification.")
+async def order_toggle() -> str:
+    return await _post(f"{SERVICES['order']}/order/toggle")
+
+
+@mcp.tool(description="Toggle the health status of the Payment service (POST /payment/toggle). Cascading effect propagates to Notification.")
+async def payment_toggle() -> str:
+    return await _post(f"{SERVICES['payment']}/payment/toggle")
+
+
+@mcp.tool(description="Toggle the health status of the Notification service (POST /notification/toggle).")
+async def notification_toggle() -> str:
+    return await _post(f"{SERVICES['notification']}/notification/toggle")
+
+
+# ── /logs ─────────────────────────────────────
+
+@mcp.tool(description="Fetch logs from the User service (GET /user/logs). Logs are stored in SQLite.")
+async def user_logs() -> str:
+    return await _get(f"{SERVICES['user']}/user/logs")
+
+
+@mcp.tool(description="Fetch logs from the Order service (GET /order/logs).")
+async def order_logs() -> str:
+    return await _get(f"{SERVICES['order']}/order/logs")
+
+
+@mcp.tool(description="Fetch logs from the Payment service (GET /payment/logs).")
+async def payment_logs() -> str:
+    return await _get(f"{SERVICES['payment']}/payment/logs")
+
+
+@mcp.tool(description="Fetch logs from the Notification service (GET /notification/logs).")
+async def notification_logs() -> str:
+    return await _get(f"{SERVICES['notification']}/notification/logs")
+
+
+@mcp.tool(description="Fetch logs from ALL four core services at once and return a combined summary.")
+async def all_logs() -> str:
+    combined = {}
+    for name in ["user", "order", "payment", "notification"]:
         try:
-            driver = self._get_driver()
-            with driver.session() as session:
-                query = """
-                    MATCH (l:Log {serviceName: $serviceName})
-                    RETURN l.status AS status, count(*) AS count
-                    ORDER BY count DESC
-                """
-                result = session.run(query, serviceName=service_name)
-                summary = {row["status"]: row["count"] for row in result}
-                total = sum(summary.values())
-                return {
-                    "serviceName": service_name,
-                    "total":       total,
-                    "breakdown":   summary,
-                }
+            combined[name] = await _get(f"{SERVICES[name]}/{name}/logs")
         except Exception as e:
-            logger.error(f"Neo4j fetch_log_summary failed for {service_name}: {e}")
-            return {"error": str(e)}
-
-    def close(self):
-        if self._driver:
-            self._driver.close()
-
-
-neo4j_client = Neo4jLogClient()
-
-# ─────────────────────────────────────────────
-# HEALTH CHECK
-# ─────────────────────────────────────────────
-
-def check_service_health(service_name: str) -> dict:
-    """
-    Calls each service's custom health endpoint which returns a plain
-    string body: "HEALTHY" or "UNHEALTHY"
-
-    e.g. GET http://localhost:8080/user/health  → "HEALTHY"
-         GET http://localhost:8083/payment/health → "UNHEALTHY"
-    """
-    base_url     = SERVICES.get(service_name)
-    health_path  = HEALTH_PATHS.get(service_name)
-
-    if not base_url or not health_path:
-        return {
-            "serviceName": service_name,
-            "status":      "UNKNOWN",
-            "error":       f"Service '{service_name}' not configured.",
-            "checked_at":  datetime.utcnow().isoformat() + "Z",
-        }
-
-    url = base_url + health_path
-    try:
-        resp   = requests.get(url, timeout=HEALTH_TIMEOUT)
-        # Response is a plain string: "HEALTHY" or "UNHEALTHY"
-        status = resp.text.strip().upper()
-
-        # Normalise anything unexpected to UNKNOWN
-        if status not in ("HEALTHY", "UNHEALTHY"):
-            status = "UNKNOWN"
-
-        return {
-            "serviceName": service_name,
-            "status":      status,          # HEALTHY | UNHEALTHY
-            "url":         url,
-            "http_code":   resp.status_code,
-            "checked_at":  datetime.utcnow().isoformat() + "Z",
-        }
-
-    except requests.exceptions.ConnectionError:
-        return {
-            "serviceName": service_name,
-            "status":      "UNHEALTHY",
-            "url":         url,
-            "error":       "Connection refused — service is not reachable.",
-            "checked_at":  datetime.utcnow().isoformat() + "Z",
-        }
-    except requests.exceptions.Timeout:
-        return {
-            "serviceName": service_name,
-            "status":      "UNHEALTHY",
-            "url":         url,
-            "error":       f"Timed out after {HEALTH_TIMEOUT}s.",
-            "checked_at":  datetime.utcnow().isoformat() + "Z",
-        }
-    except Exception as e:
-        return {
-            "serviceName": service_name,
-            "status":      "UNKNOWN",
-            "url":         url,
-            "error":       str(e),
-            "checked_at":  datetime.utcnow().isoformat() + "Z",
-        }
-
-
-def check_all_services_health() -> list[dict]:
-    return [check_service_health(name) for name in SERVICES]
+            combined[name] = f"ERROR: {e}"
+    return json.dumps(combined, indent=2)
 
 
 # ─────────────────────────────────────────────
-# KAII AGENT TRIGGER
+# ── TICKET SERVICE TOOLS ─────────────────────
 # ─────────────────────────────────────────────
 
-def trigger_kaii_agent(service_name: str, health_result: dict,
-                        unhealthy_logs: list[dict], log_summary: dict) -> dict:
-    """
-    Sends unhealthy service context to Kaii Agent via REST POST.
-    Kaii will analyse the logs + health data and suggest/apply a fix.
-
-    Payload includes:
-    - actuator health status (UP/DOWN) from Spring Boot
-    - log_summary: count breakdown of HEALTHY/UNHEALTHY/DEGRADED from Neo4j
-    - unhealthy_logs: last 20 UNHEALTHY/DEGRADED LogNode entries from Neo4j
-      Each log matches your @Node("Log") model: { id, serviceName, status, message, error, timestamp }
-    """
+@mcp.tool(description=(
+    "Create a new ticket in the Ticket service (POST /tickets). "
+    "Parameters: ticketId (str), service (str — must be user/order/payment/notification), "
+    "severity (str), error (str)."
+))
+async def create_ticket(ticketId: str, service: str, severity: str, error: str) -> str:
     payload = {
-        "serviceName":      service_name,
-        "healthStatus":     health_result.get("status"),    # HEALTHY | UNHEALTHY | UNKNOWN
-        "healthUrl":        health_result.get("url"),
-        "healthError":      health_result.get("error"),     # set when service is unreachable
-        "log_summary":      log_summary,
-        "unhealthy_logs":   unhealthy_logs,
-        "requested_action": "diagnose_and_fix",
-        "metadata": {
-            "base_path":      os.getcwd(),
-            "restart_script": RESTART_SCRIPTS.get(service_name, ""),
-            "triggered_at":   datetime.utcnow().isoformat() + "Z",
-        }
+        "ticketId": ticketId,
+        "service": service,
+        "severity": severity,
+        "error": error,
     }
+    return await _post(f"{SERVICES['ticket']}/tickets", json_body=payload)
+
+
+@mcp.tool(description="Get a ticket by ID from the Ticket service (GET /tickets/{id}).")
+async def get_ticket(ticket_id: str) -> str:
+    return await _get(f"{SERVICES['ticket']}/tickets/{ticket_id}")
+
+
+@mcp.tool(description=(
+    "Update an existing ticket (PUT /tickets/{id}). "
+    "Parameters: ticket_id (str), severity (str), error (str)."
+))
+async def update_ticket(ticket_id: str, severity: str, error: str) -> str:
+    payload = {"severity": severity, "error": error}
+    return await _put(f"{SERVICES['ticket']}/tickets/{ticket_id}", json_body=payload)
+
+
+@mcp.tool(description="Resolve a ticket by ID (POST /tickets/{id}/resolve). Marks it as resolved in Neo4j.")
+async def resolve_ticket(ticket_id: str) -> str:
+    return await _post(f"{SERVICES['ticket']}/tickets/{ticket_id}/resolve")
+
+
+@mcp.tool(description="Mark a ticket as in-progress by ID (POST /tickets/{id}/progress).")
+async def progress_ticket(ticket_id: str) -> str:
+    return await _post(f"{SERVICES['ticket']}/tickets/{ticket_id}/progress")
+
+
+@mcp.tool(description="Get all OPEN tickets from the Ticket service (GET /tickets/open).")
+async def get_open_tickets() -> str:
+    return await _get(f"{SERVICES['ticket']}/tickets/open")
+
+
+@mcp.tool(description="Get all RESOLVED tickets from the Ticket service (GET /tickets/resolved).")
+async def get_resolved_tickets() -> str:
+    return await _get(f"{SERVICES['ticket']}/tickets/resolved")
+
+
+# ─────────────────────────────────────────────
+# ── BATCH TICKET PROCESSING ──────────────────
+# ─────────────────────────────────────────────
+
+@mcp.tool(description=(
+    "Batch-resolve ALL open tickets automatically. "
+    "Fetches all open tickets from the Ticket service and resolves each one. "
+    "Returns a summary of how many were resolved and any failures. "
+    "Use this for automated periodic resolution instead of resolving one by one."
+))
+async def batch_resolve_open_tickets() -> str:
+    """
+    Periodically callable batch tool: fetches all open tickets and resolves them.
+    Ideal for scheduled runs (e.g., every N minutes via a cron or agent loop).
+    """
+    resolved_ids = []
+    failed = []
 
     try:
-        resp = requests.post(
-            KAII_AGENT_URL,
-            json=payload,
-            timeout=30,
-            headers={"Content-Type": "application/json"}
-        )
-        return {
-            "kaii_status":   resp.status_code,
-            "kaii_response": resp.json() if resp.headers.get(
-                "content-type", "").startswith("application/json") else resp.text,
-            "payload_sent":  payload,
-        }
+        raw = await _get(f"{SERVICES['ticket']}/tickets/open")
+        tickets = json.loads(raw)
     except Exception as e:
-        return {
-            "kaii_status":   "ERROR",
-            "error":         str(e),
-            "payload_sent":  payload,
-        }
+        return json.dumps({"error": f"Failed to fetch open tickets: {e}"})
+
+    if not tickets:
+        return json.dumps({"message": "No open tickets found.", "resolved": [], "failed": []})
+
+    for ticket in tickets:
+        tid = ticket.get("ticketId") or ticket.get("id")
+        if not tid:
+            continue
+        try:
+            await _post(f"{SERVICES['ticket']}/tickets/{tid}/resolve")
+            resolved_ids.append(tid)
+        except Exception as e:
+            failed.append({"ticketId": tid, "error": str(e)})
+
+    return json.dumps({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "total_open": len(tickets),
+        "resolved_count": len(resolved_ids),
+        "resolved_ids": resolved_ids,
+        "failed_count": len(failed),
+        "failures": failed,
+    }, indent=2)
 
 
-# ─────────────────────────────────────────────
-# RESTART SERVICE
-# ─────────────────────────────────────────────
-
-def restart_service(service_name: str) -> dict:
-    """Runs the local shell restart script for the given service."""
-    script = RESTART_SCRIPTS.get(service_name)
-    if not script:
-        return {
-            "service": service_name,
-            "success": False,
-            "error":   f"No restart script configured for '{service_name}'."
-        }
-
-    if not os.path.isfile(script):
-        return {
-            "service": service_name,
-            "success": False,
-            "error":   f"Script not found: {script}"
-        }
+@mcp.tool(description=(
+    "Batch-process open tickets for a specific service (user/order/payment/notification). "
+    "Fetches all open tickets, filters by service name, and resolves matching ones. "
+    "Useful for targeted batch resolution of a single degraded service."
+))
+async def batch_resolve_tickets_by_service(service: str) -> str:
+    resolved_ids = []
+    failed = []
 
     try:
-        result = subprocess.run(
-            ["bash", script],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        return {
-            "service":     service_name,
-            "success":     result.returncode == 0,
-            "returncode":  result.returncode,
-            "stdout":      result.stdout.strip(),
-            "stderr":      result.stderr.strip(),
-            "script_used": script,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "service": service_name,
-            "success": False,
-            "error":   "Restart script timed out after 60 seconds."
-        }
+        raw = await _get(f"{SERVICES['ticket']}/tickets/open")
+        tickets = json.loads(raw)
     except Exception as e:
-        return {
-            "service": service_name,
-            "success": False,
-            "error":   str(e)
-        }
+        return json.dumps({"error": f"Failed to fetch open tickets: {e}"})
+
+    matching = [t for t in tickets if t.get("service", "").lower() == service.lower()]
+
+    if not matching:
+        return json.dumps({"message": f"No open tickets for service '{service}'.", "resolved": []})
+
+    for ticket in matching:
+        tid = ticket.get("ticketId") or ticket.get("id")
+        if not tid:
+            continue
+        try:
+            await _post(f"{SERVICES['ticket']}/tickets/{tid}/resolve")
+            resolved_ids.append(tid)
+        except Exception as e:
+            failed.append({"ticketId": tid, "error": str(e)})
+
+    return json.dumps({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "service": service,
+        "matched": len(matching),
+        "resolved_count": len(resolved_ids),
+        "resolved_ids": resolved_ids,
+        "failed_count": len(failed),
+        "failures": failed,
+    }, indent=2)
 
 
 # ─────────────────────────────────────────────
-# MCP SERVER
+# ── DEPENDENCY GRAPH ─────────────────────────
 # ─────────────────────────────────────────────
 
-app = Server("microservice-health-monitor")
-
-
-@app.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
-        types.Tool(
-            name="check_health",
-            description=(
-                "Check the health of one or all Spring Boot microservices. "
-                "Each service exposes a custom health endpoint (e.g. /user/health) "
-                "returning a plain string: HEALTHY or UNHEALTHY."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "service": {
-                        "type": "string",
-                        "description": (
-                            "Name of the service to check: 'user', 'order', "
-                            "'payment', 'notification'. Omit to check all."
-                        ),
-                        "enum": ["user", "order", "payment", "notification", "all"]
-                    }
-                },
-                "required": []
-            }
+@mcp.tool(description=(
+    "Return the full dependency graph of all microservices. "
+    "Shows which services depend on which, including the Ticket service "
+    "which tracks issues for all four core services stored in Neo4j."
+))
+async def get_dependency_graph() -> str:
+    graph = {
+        "description": (
+            "Directed dependency graph. "
+            "An entry A -> [B] means service A calls service B downstream."
         ),
-
-        types.Tool(
-            name="fetch_logs",
-            description=(
-                "Fetch LogNode entries for a microservice from Neo4j. "
-                "Matches your @Node(\'Log\') model: id (Long), message, status, error, timestamp, serviceName. "
-                "Optionally filter by status: HEALTHY | UNHEALTHY | DEGRADED."
+        "nodes": list(SERVICES.keys()),
+        "edges": DEPENDENCY_GRAPH,
+        "ports": {name: url.replace("http://localhost:", "") for name, url in SERVICES.items()},
+        "cascade_chain": "user → order → payment → notification",
+        "ticket_service": {
+            "port": 8090,
+            "storage": "Neo4j (graph DB)",
+            "tracks": ["user", "order", "payment", "notification"],
+            "note": (
+                "Tickets are created from Excel files uploaded by users. "
+                "The Ticket service stores and manages them as graph nodes in Neo4j, "
+                "linked to the affected service nodes."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "service": {
-                        "type": "string",
-                        "description": "Service name (maps to serviceName field in LogNode).",
-                        "enum": ["user", "order", "payment", "notification"]
-                    },
-                    "status": {
-                        "type": "string",
-                        "description": "Optional status filter matching LogNode.status values.",
-                        "enum": ["HEALTHY", "UNHEALTHY", "DEGRADED"]
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max number of log entries to return (default 50).",
-                        "default": 50
-                    }
-                },
-                "required": ["service"]
-            }
-        ),
-
-        types.Tool(
-            name="trigger_fix",
-            description=(
-                "Send an unhealthy service report to the Kaii Agent via REST. "
-                "Kaii will analyse health data + error logs and attempt to "
-                "diagnose the issue and apply fixes to local files."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "service": {
-                        "type": "string",
-                        "description": "Service name to report to Kaii.",
-                        "enum": ["user", "order", "payment", "notification"]
-                    },
-                    "auto_fetch_logs": {
-                        "type": "boolean",
-                        "description": (
-                            "If true (default), automatically fetch error logs "
-                            "from Neo4j and include them in the Kaii payload."
-                        ),
-                        "default": True
-                    }
-                },
-                "required": ["service"]
-            }
-        ),
-
-        types.Tool(
-            name="restart_service",
-            description=(
-                "Run the local shell restart script for a Spring Boot microservice. "
-                "Use after Kaii applies a fix, or for a quick manual restart."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "service": {
-                        "type": "string",
-                        "description": "Service to restart: user, order, payment, notification.",
-                        "enum": ["user", "order", "payment", "notification"]
-                    }
-                },
-                "required": ["service"]
-            }
-        ),
-    ]
-
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-
-    # ── check_health ──────────────────────────────────────────────────────────
-    if name == "check_health":
-        service = arguments.get("service", "all")
-
-        if service and service != "all":
-            result = check_service_health(service)
-        else:
-            result = check_all_services_health()
-
-        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-
-    # ── fetch_logs ────────────────────────────────────────────────────────────
-    elif name == "fetch_logs":
-        service       = arguments.get("service")
-        status_filter = arguments.get("status")       # HEALTHY | UNHEALTHY | DEGRADED
-        limit         = arguments.get("limit", LOG_FETCH_LIMIT)
-
-        if not service:
-            return [types.TextContent(type="text",
-                                      text=json.dumps({"error": "service is required"}))]
-
-        logs    = neo4j_client.fetch_logs(service, limit=limit, status_filter=status_filter)
-        summary = neo4j_client.fetch_log_summary(service)
-
-        return [types.TextContent(type="text", text=json.dumps({
-            "serviceName":   service,
-            "status_filter": status_filter,
-            "count":         len(logs),
-            "summary":       summary,
-            "logs":          logs,
-        }, indent=2))]
-
-    # ── trigger_fix ───────────────────────────────────────────────────────────
-    elif name == "trigger_fix":
-        service         = arguments.get("service")
-        auto_fetch_logs = arguments.get("auto_fetch_logs", True)
-
-        if not service:
-            return [types.TextContent(type="text",
-                                      text=json.dumps({"error": "service is required"}))]
-
-        # 1. Get Spring Actuator health snapshot
-        health = check_service_health(service)
-
-        # 2. Fetch UNHEALTHY/DEGRADED LogNode entries + summary from Neo4j
-        unhealthy_logs = []
-        log_summary    = {}
-        if auto_fetch_logs:
-            unhealthy_logs = neo4j_client.fetch_unhealthy_logs(service, limit=20)
-            log_summary    = neo4j_client.fetch_log_summary(service)
-
-        # 3. Fire full context to Kaii Agent
-        kaii_result = trigger_kaii_agent(service, health, unhealthy_logs, log_summary)
-
-        return [types.TextContent(type="text", text=json.dumps({
-            "serviceName":         service,
-            "health":              health,
-            "log_summary":         log_summary,
-            "unhealthy_logs_sent": len(unhealthy_logs),
-            "kaii_result":         kaii_result,
-        }, indent=2))]
-
-    # ── restart_service ───────────────────────────────────────────────────────
-    elif name == "restart_service":
-        service = arguments.get("service")
-
-        if not service:
-            return [types.TextContent(type="text",
-                                      text=json.dumps({"error": "service is required"}))]
-
-        result = restart_service(service)
-        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-
-    else:
-        return [types.TextContent(type="text",
-                                  text=json.dumps({"error": f"Unknown tool: {name}"}))]
+        },
+        "log_storage": "SQLite (per-service)",
+    }
+    return json.dumps(graph, indent=2)
 
 
 # ─────────────────────────────────────────────
-# ENTRY POINT
+# ── SYSTEM OVERVIEW ──────────────────────────
 # ─────────────────────────────────────────────
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options()
-        )
+@mcp.tool(description=(
+    "Full system snapshot: health of all 4 core services + open ticket count. "
+    "Use this as a quick dashboard call at the start of any monitoring session."
+))
+async def system_snapshot() -> str:
+    health = {}
+    for name in ["user", "order", "payment", "notification"]:
+        try:
+            health[name] = await _get(f"{SERVICES[name]}/{name}/health")
+        except Exception as e:
+            health[name] = f"UNREACHABLE: {e}"
 
+    try:
+        open_raw = await _get(f"{SERVICES['ticket']}/tickets/open")
+        open_tickets = json.loads(open_raw)
+        open_count = len(open_tickets)
+    except Exception as e:
+        open_tickets = []
+        open_count = f"ERROR: {e}"
+
+    return json.dumps({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "service_health": health,
+        "open_tickets": open_count,
+        "cascade_chain": "user(8080) → order(8082) → payment(8083) → notification(8084)",
+        "ticket_service": f"{SERVICES['ticket']} [Neo4j]",
+    }, indent=2)
+
+
+# ─────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    asyncio.run(main())
+    # SSE transport exposes the MCP server on HTTP so Kaii agent can discover it.
+    # After running, use a cloud tunnel (e.g. ngrok / cloudflared) to get a public URL:
+    #   ngrok http 8000
+    #   cloudflared tunnel --url http://localhost:8000
+    # Then register that public URL in Kaii as an MCP server endpoint.
+    mcp.run(transport="sse", host="0.0.0.0", port=8000)
